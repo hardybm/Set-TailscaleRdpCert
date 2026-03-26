@@ -1,4 +1,4 @@
-```markdown
+
 # Tailscale RDP Certificate Manager
 
 Automatically generate and bind a valid TLS certificate to the Windows Remote Desktop (RDP) listener using [Tailscale](https://tailscale.com/) and Let's Encrypt.
