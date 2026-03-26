@@ -4,7 +4,7 @@
 .SYNOPSIS
     Generates a Tailscale HTTPS certificate and binds it to the Windows Remote Desktop listener.
 .DESCRIPTION
-    - Ensures Tailscale and OpenSSL are installed (via winget)
+    - Ensures Tailscale and OpenSSL are available
     - Gets the machine's Tailscale FQDN
     - Generates a TLS cert using `tailscale cert`
     - Converts to PFX via OpenSSL
@@ -30,15 +30,10 @@ function Write-Step {
     Write-Host "`n[$((Get-Date).ToString('HH:mm:ss'))] $Message" -ForegroundColor Cyan
 }
 
-function Assert-Command {
-    param([string]$Name)
-    return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
-}
-
 function Get-OpenSslPath {
-    # Check common install locations as winget-installed OpenSSL may not be on PATH
     $candidates = @(
         "openssl"
+        "C:\Program Files\FireDaemon OpenSSL 3\bin\openssl.exe"
         "C:\Program Files\OpenSSL-Win64\bin\openssl.exe"
         "C:\Program Files\OpenSSL\bin\openssl.exe"
         "C:\Program Files (x86)\OpenSSL-Win32\bin\openssl.exe"
@@ -54,44 +49,7 @@ function Get-OpenSslPath {
     return $null
 }
 
-function Install-IfMissing {
-    param(
-        [string]$CommandName,
-        [string]$WingetId,
-        [string]$DisplayName
-    )
-
-    if (Assert-Command $CommandName) {
-        Write-Host "  $DisplayName is already installed." -ForegroundColor Green
-        return
-    }
-
-    # Special handling for OpenSSL (may be installed but not on PATH)
-    if ($CommandName -eq "openssl" -and (Get-OpenSslPath)) {
-        Write-Host "  $DisplayName found at $(Get-OpenSslPath)." -ForegroundColor Green
-        return
-    }
-
-    Write-Host "  Installing $DisplayName via winget..." -ForegroundColor Yellow
-
-    if (-not (Assert-Command "winget")) {
-        throw "winget is not available. Please install $DisplayName manually."
-    }
-
-    winget install --id $WingetId --accept-source-agreements --accept-package-agreements --silent
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to install $DisplayName via winget."
-    }
-
-    # Refresh PATH for current session
-    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
-                [System.Environment]::GetEnvironmentVariable("Path", "User")
-
-    Write-Host "  $DisplayName installed successfully." -ForegroundColor Green
-}
-
 function Get-TailscaleFqdn {
-    # Use `tailscale status --json` to get the FQDN
     $statusJson = & tailscale status --json 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to get Tailscale status. Is Tailscale running and logged in?`n$statusJson"
@@ -99,8 +57,6 @@ function Get-TailscaleFqdn {
 
     $status = $statusJson | ConvertFrom-Json
     $self = $status.Self
-
-    # DNSName ends with a trailing dot — remove it
     $fqdn = $self.DNSName.TrimEnd('.')
 
     if ([string]::IsNullOrWhiteSpace($fqdn)) {
@@ -136,16 +92,19 @@ Write-Host "=============================================" -ForegroundColor Whit
 Write-Host " Tailscale RDP Certificate Setup" -ForegroundColor White
 Write-Host "=============================================" -ForegroundColor White
 
-# Step 1: Ensure dependencies
+# Step 1: Check dependencies
 Write-Step "Step 1: Checking dependencies"
-Install-IfMissing -CommandName "tailscale" -WingetId "Tailscale.Tailscale" -DisplayName "Tailscale"
-Install-IfMissing -CommandName "openssl"   -WingetId "ShiningLight.OpenSSL" -DisplayName "OpenSSL"
+
+if (-not (Get-Command "tailscale" -ErrorAction SilentlyContinue)) {
+    throw "Tailscale is not installed or not on PATH. Please install it from https://tailscale.com/download and try again."
+}
+Write-Host "  Tailscale: OK" -ForegroundColor Green
 
 $openssl = Get-OpenSslPath
 if (-not $openssl) {
-    throw "OpenSSL could not be found after installation. Please add it to your PATH or restart your terminal."
+    throw "OpenSSL is not installed or not on PATH. Please install it (e.g. 'winget install FireDaemon.OpenSSL' or from https://slproweb.com/products/Win32OpenSSL.html) and try again."
 }
-Write-Host "  Using OpenSSL at: $openssl" -ForegroundColor Gray
+Write-Host "  OpenSSL:   OK ($openssl)" -ForegroundColor Green
 
 # Step 2: Get Tailscale FQDN
 Write-Step "Step 2: Getting Tailscale FQDN"
@@ -172,7 +131,6 @@ Write-Host "  Certificate generated." -ForegroundColor Green
 # Step 4: Convert to PFX
 Write-Step "Step 4: Converting to PFX"
 
-# Use a random password for the PFX (only needed transiently for import)
 $pfxPassword = [System.Guid]::NewGuid().ToString("N")
 
 & $openssl pkcs12 -export `
@@ -206,7 +164,6 @@ Write-Host "  Expires: $($importedCert.NotAfter)" -ForegroundColor Gray
 # Step 6: Bind certificate to RDP listener
 Write-Step "Step 6: Configuring RDP to use the certificate"
 
-# Method: WMI (Win32_TSGeneralSetting)
 $tsPath = (Get-WmiObject -Class "Win32_TSGeneralSetting" -Namespace "root\cimv2\TerminalServices" -Filter "TerminalName='RDP-tcp'")
 if ($null -eq $tsPath) {
     throw "Could not find the RDP-tcp listener. Is Remote Desktop enabled?"
@@ -215,7 +172,6 @@ if ($null -eq $tsPath) {
 Set-WmiInstance -Path $tsPath.__PATH -Argument @{ SSLCertificateSHA1Hash = $thumbprint } | Out-Null
 Write-Host "  RDP listener bound to certificate $thumbprint" -ForegroundColor Green
 
-# Also set the registry value as a fallback / for persistence
 $rdpRegPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
 Set-ItemProperty -Path $rdpRegPath -Name "SSLCertificateSHA1Hash" -Value ([byte[]](@(
     for ($i = 0; $i -lt $thumbprint.Length; $i += 2) {
@@ -243,7 +199,6 @@ if ($CreateScheduledTask) {
     else {
         $taskName = "Tailscale-RDP-Cert-Renewal"
 
-        # Remove existing task if present
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 
         $action  = New-ScheduledTaskAction -Execute "powershell.exe" `
