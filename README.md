@@ -3,6 +3,8 @@
 
 Automatically generate and bind a valid TLS certificate to the Windows Remote Desktop (RDP) listener using [Tailscale](https://tailscale.com/) and Let's Encrypt.
 
+This is all vibe coded AI slop but it seems to work
+
 ## Why?
 
 By default, Windows RDP uses a self-signed certificate. This means every time you connect, you see an ugly trust warning — and you have no way to verify you're connecting to the right machine.
