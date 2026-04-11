@@ -86,6 +86,59 @@ function Remove-OldTailscaleCerts {
     $store.Close()
 }
 
+function Grant-PrivateKeyAccess {
+    param(
+        [string]$Thumbprint,
+        [string]$AccountName = "NETWORK SERVICE"
+    )
+
+    try {
+        $cert = Get-ChildItem -Path "Cert:\LocalMachine\My" | Where-Object { $_.Thumbprint -eq $Thumbprint }
+        if (-not $cert) {
+            Write-Host "  WARNING: Could not find certificate with thumbprint $Thumbprint" -ForegroundColor Yellow
+            return
+        }
+
+        # Get the private key
+        $privateKey = $cert.PrivateKey
+        if (-not $privateKey) {
+            Write-Host "  WARNING: Certificate has no private key" -ForegroundColor Yellow
+            return
+        }
+
+        # Get the key file path
+        $keyPath = $privateKey.CspKeyContainerInfo.UniqueKeyContainerName
+        if (-not $keyPath) {
+            Write-Host "  WARNING: Could not determine private key path" -ForegroundColor Yellow
+            return
+        }
+
+        # Construct the full path to the key file
+        $keyDir = "$env:ProgramData\Microsoft\Crypto\RSA\MachineKeys"
+        $keyFile = Join-Path $keyDir $keyPath
+
+        if (-not (Test-Path $keyFile)) {
+            Write-Host "  WARNING: Private key file not found at $keyFile" -ForegroundColor Yellow
+            return
+        }
+
+        # Grant NETWORK SERVICE read access to the private key
+        $acl = Get-Acl -Path $keyFile
+        $permission = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $AccountName,
+            [System.Security.AccessControl.FileSystemRights]::Read,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        )
+        $acl.AddAccessRule($permission)
+        Set-Acl -Path $keyFile -AclObject $acl
+
+        Write-Host "  Granted $AccountName read access to private key." -ForegroundColor Green
+    }
+    catch {
+        Write-Host "  WARNING: Could not grant private key access: $_" -ForegroundColor Yellow
+    }
+}
+
 # ─── Main Script ───────────────────────────────────────────────────
 
 Write-Host "=============================================" -ForegroundColor White
@@ -161,6 +214,9 @@ Write-Host "  Imported certificate thumbprint: $thumbprint" -ForegroundColor Gre
 Write-Host "  Subject: $($importedCert.Subject)" -ForegroundColor Gray
 Write-Host "  Expires: $($importedCert.NotAfter)" -ForegroundColor Gray
 
+# Grant NETWORK SERVICE access to the private key
+Grant-PrivateKeyAccess -Thumbprint $thumbprint -AccountName "NETWORK SERVICE"
+
 # Step 6: Bind certificate to RDP listener
 Write-Step "Step 6: Configuring RDP to use the certificate"
 
@@ -180,17 +236,22 @@ Set-ItemProperty -Path $rdpRegPath -Name "SSLCertificateSHA1Hash" -Value ([byte[
 )))
 Write-Host "  Registry updated." -ForegroundColor Green
 
-# Step 7: Cleanup temp files
-Write-Step "Step 7: Cleaning up temporary files"
+# Restart RDP service to apply changes
+Write-Step "Step 7: Restarting RDP service"
+Restart-Service TermService -Force
+Write-Host "  RDP service restarted." -ForegroundColor Green
+
+# Step 8: Cleanup temp files
+Write-Step "Step 8: Cleaning up temporary files"
 Remove-Item -Path $certFile -Force -ErrorAction SilentlyContinue
 Remove-Item -Path $keyFile  -Force -ErrorAction SilentlyContinue
 Remove-Item -Path $pfxFile  -Force -ErrorAction SilentlyContinue
 Remove-Item -Path $TempDir  -Force -ErrorAction SilentlyContinue -Recurse
 Write-Host "  Temporary files removed." -ForegroundColor Green
 
-# Step 8 (Optional): Create a Scheduled Task for renewal
+# Step 9 (Optional): Create a Scheduled Task for renewal
 if ($CreateScheduledTask) {
-    Write-Step "Step 8: Creating scheduled task for automatic renewal"
+    Write-Step "Step 9: Creating scheduled task for automatic renewal"
 
     $scriptPath = $MyInvocation.MyCommand.Path
     if ([string]::IsNullOrWhiteSpace($scriptPath)) {
